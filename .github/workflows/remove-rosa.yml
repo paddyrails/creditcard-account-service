@@ -1,0 +1,87 @@
+name: Remove from ROSA
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "DELETE" to confirm removal'
+        required: true
+      remove_secrets:
+        description: 'Also remove secrets?'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  SERVICE_NAME: creditcard-card-service
+  NAMESPACE: creditcard
+  OPENSHIFT_SERVER: ${{ secrets.OPENSHIFT_SERVER }}
+  OPENSHIFT_TOKEN: ${{ secrets.OPENSHIFT_TOKEN }}
+
+jobs:
+  remove:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirm == 'DELETE' }}
+    
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DELETE" ]; then
+            echo "Confirmation failed. You must type 'DELETE' to proceed."
+            exit 1
+          fi
+          echo "Confirmation received. Proceeding with removal..."
+
+      - name: Install OpenShift CLI
+        run: |
+          curl -sLO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xzf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+          oc version --client
+
+      - name: Login to OpenShift
+        run: |
+          oc login --token=${{ env.OPENSHIFT_TOKEN }} --server=${{ env.OPENSHIFT_SERVER }} --insecure-skip-tls-verify=true
+          oc project ${{ env.NAMESPACE }}
+
+      - name: Remove Route
+        run: |
+          echo "Removing Route..."
+          oc delete route ${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }} --ignore-not-found=true
+
+      - name: Remove Service
+        run: |
+          echo "Removing Service..."
+          oc delete service ${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }} --ignore-not-found=true
+
+      - name: Remove Deployment
+        run: |
+          echo "Removing Deployment..."
+          oc delete deployment ${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }} --ignore-not-found=true
+
+      - name: Remove ConfigMap
+        run: |
+          echo "Removing ConfigMap..."
+          oc delete configmap ${{ env.SERVICE_NAME }}-config -n ${{ env.NAMESPACE }} --ignore-not-found=true
+
+      - name: Remove Secret
+        if: ${{ github.event.inputs.remove_secrets == 'true' }}
+        run: |
+          echo "Removing Secret..."
+          oc delete secret ${{ env.SERVICE_NAME }}-secret -n ${{ env.NAMESPACE }} --ignore-not-found=true
+
+      - name: Verify removal
+        run: |
+          echo "=== Remaining resources for ${{ env.SERVICE_NAME }} ==="
+          oc get all -l app=${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }} || echo "No resources found"
+
+      - name: Removal Summary
+        run: |
+          echo "## Removal Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ env.SERVICE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | ${{ env.NAMESPACE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets Removed | ${{ github.event.inputs.remove_secrets }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ✅ Removed |" >> $GITHUB_STEP_SUMMARY

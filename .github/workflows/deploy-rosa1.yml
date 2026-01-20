@@ -12,22 +12,16 @@ on:
         description: 'Image tag to deploy (default: latest)'
         required: false
         default: 'latest'
-      environment:
-        description: 'Environment to deploy to'
-        required: false
-        default: 'production'
-        type: choice
-        options:
-          - production
-          - staging
 
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: creditcard-account-service
   SERVICE_NAME: creditcard-account-service
   NAMESPACE: creditcard
-  OPENSHIFT_SERVER: ${{ secrets.OPENSHIFT_SERVER }}
-  OPENSHIFT_TOKEN: ${{ secrets.OPENSHIFT_TOKEN }}
+  DB_HOST: creditcard-account-db
+  DB_PORT: "5432"
+  DB_NAME: accountdb
+  DB_USERNAME: dbadmin
 
 jobs:
   deploy:
@@ -63,109 +57,75 @@ jobs:
           curl -sLO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
           tar -xzf openshift-client-linux.tar.gz
           sudo mv oc kubectl /usr/local/bin/
-          oc version --client
 
       - name: Login to OpenShift
         run: |
-          oc login --token=${{ env.OPENSHIFT_TOKEN }} --server=${{ env.OPENSHIFT_SERVER }} --insecure-skip-tls-verify=true
-
-      - name: Create namespace if not exists
-        run: |
-          oc get namespace ${{ env.NAMESPACE }} || oc create namespace ${{ env.NAMESPACE }}
+          oc login --token=${{ secrets.OPENSHIFT_TOKEN }} --server=${{ secrets.OPENSHIFT_SERVER }} --insecure-skip-tls-verify=true
           oc project ${{ env.NAMESPACE }}
 
       - name: Create ECR pull secret
         run: |
           ECR_PASSWORD=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
           ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
-          
           oc delete secret ecr-pull-secret -n ${{ env.NAMESPACE }} --ignore-not-found=true
-          
           oc create secret docker-registry ecr-pull-secret \
-            --docker-server=${ECR_REGISTRY} \
-            --docker-username=AWS \
-            --docker-password=${ECR_PASSWORD} \
-            -n ${{ env.NAMESPACE }}
-          
+            --docker-server=${ECR_REGISTRY} --docker-username=AWS --docker-password=${ECR_PASSWORD} -n ${{ env.NAMESPACE }}
           oc secrets link default ecr-pull-secret --for=pull -n ${{ env.NAMESPACE }}
 
-      - name: Create/Update ConfigMap
+      - name: Create ConfigMap and Secret
         run: |
-          cat <<EOF | oc apply -f -
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: ${{ env.SERVICE_NAME }}-config
-            namespace: ${{ env.NAMESPACE }}
-          data:
-            SPRING_PROFILE: "prod"
-            DB_PORT: "5432"
-            DB_NAME: "accountdb"
-          EOF
+          oc delete configmap ${{ env.SERVICE_NAME }}-config -n ${{ env.NAMESPACE }} --ignore-not-found=true
+          oc delete secret ${{ env.SERVICE_NAME }}-secret -n ${{ env.NAMESPACE }} --ignore-not-found=true
+          oc create configmap ${{ env.SERVICE_NAME }}-config \
+            --from-literal=SPRING_PROFILES_ACTIVE=prod \
+            --from-literal=DB_HOST=${{ env.DB_HOST }} \
+            --from-literal=DB_PORT=${{ env.DB_PORT }} \
+            --from-literal=DB_NAME=${{ env.DB_NAME }} \
+            --from-literal=DB_USERNAME=${{ env.DB_USERNAME }} \
+            -n ${{ env.NAMESPACE }}
+          oc create secret generic ${{ env.SERVICE_NAME }}-secret \
+            --from-literal=DB_PASSWORD='${{ secrets.DB_PASSWORD }}' -n ${{ env.NAMESPACE }}
 
-      - name: Create/Update Secret
-        run: |
-          if ! oc get secret ${{ env.SERVICE_NAME }}-secret -n ${{ env.NAMESPACE }} &>/dev/null; then
-            oc create secret generic ${{ env.SERVICE_NAME }}-secret \
-              --from-literal=DB_HOST=${{ secrets.DB_HOST }} \
-              --from-literal=DB_USERNAME=${{ secrets.DB_USERNAME }} \
-              --from-literal=DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
-              -n ${{ env.NAMESPACE }}
-          fi
-
-      - name: Deploy to OpenShift
+      - name: Deploy application
         run: |
           ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG=${{ steps.image-tag.outputs.tag }}
+          FULL_IMAGE="${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
           
-          cat <<EOF | oc apply -f -
+          cat <<DEPLOY | oc apply -f -
           apiVersion: apps/v1
           kind: Deployment
           metadata:
             name: ${{ env.SERVICE_NAME }}
             namespace: ${{ env.NAMESPACE }}
-            labels:
-              app: ${{ env.SERVICE_NAME }}
-              version: "${IMAGE_TAG}"
           spec:
             replicas: 2
             selector:
               matchLabels:
                 app: ${{ env.SERVICE_NAME }}
-            strategy:
-              type: RollingUpdate
-              rollingUpdate:
-                maxSurge: 1
-                maxUnavailable: 0
             template:
               metadata:
                 labels:
                   app: ${{ env.SERVICE_NAME }}
-                  version: "${IMAGE_TAG}"
-                annotations:
-                  prometheus.io/scrape: "true"
-                  prometheus.io/port: "8080"
-                  prometheus.io/path: "/actuator/prometheus"
               spec:
                 imagePullSecrets:
                   - name: ecr-pull-secret
                 containers:
                   - name: ${{ env.SERVICE_NAME }}
-                    image: ${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}
+                    image: ${FULL_IMAGE}
                     imagePullPolicy: Always
                     ports:
                       - containerPort: 8080
-                        protocol: TCP
                     env:
-                      - name: SPRING_PROFILE
+                      - name: SPRING_PROFILES_ACTIVE
                         valueFrom:
                           configMapKeyRef:
                             name: ${{ env.SERVICE_NAME }}-config
-                            key: SPRING_PROFILE
+                            key: SPRING_PROFILES_ACTIVE
                       - name: DB_HOST
                         valueFrom:
-                          secretKeyRef:
-                            name: ${{ env.SERVICE_NAME }}-secret
+                          configMapKeyRef:
+                            name: ${{ env.SERVICE_NAME }}-config
                             key: DB_HOST
                       - name: DB_PORT
                         valueFrom:
@@ -179,8 +139,8 @@ jobs:
                             key: DB_NAME
                       - name: DB_USERNAME
                         valueFrom:
-                          secretKeyRef:
-                            name: ${{ env.SERVICE_NAME }}-secret
+                          configMapKeyRef:
+                            name: ${{ env.SERVICE_NAME }}-config
                             key: DB_USERNAME
                       - name: DB_PASSWORD
                         valueFrom:
@@ -198,98 +158,62 @@ jobs:
                       httpGet:
                         path: /actuator/health/liveness
                         port: 8080
-                      initialDelaySeconds: 60
+                      initialDelaySeconds: 90
                       periodSeconds: 10
-                      timeoutSeconds: 5
-                      failureThreshold: 3
                     readinessProbe:
                       httpGet:
                         path: /actuator/health/readiness
                         port: 8080
-                      initialDelaySeconds: 30
+                      initialDelaySeconds: 60
                       periodSeconds: 5
-                      timeoutSeconds: 3
-                      failureThreshold: 3
                     startupProbe:
                       httpGet:
                         path: /actuator/health
                         port: 8080
-                      initialDelaySeconds: 10
+                      initialDelaySeconds: 30
                       periodSeconds: 10
-                      timeoutSeconds: 5
                       failureThreshold: 30
-          EOF
+          DEPLOY
 
-      - name: Create/Update Service
+      - name: Create Service and Route
         run: |
-          cat <<EOF | oc apply -f -
+          cat <<SVC | oc apply -f -
           apiVersion: v1
           kind: Service
           metadata:
             name: ${{ env.SERVICE_NAME }}
             namespace: ${{ env.NAMESPACE }}
-            labels:
-              app: ${{ env.SERVICE_NAME }}
           spec:
             type: ClusterIP
             ports:
               - port: 8080
                 targetPort: 8080
-                protocol: TCP
                 name: http
             selector:
               app: ${{ env.SERVICE_NAME }}
-          EOF
-
-      - name: Create/Update Route
-        run: |
-          cat <<EOF | oc apply -f -
+          ---
           apiVersion: route.openshift.io/v1
           kind: Route
           metadata:
             name: ${{ env.SERVICE_NAME }}
             namespace: ${{ env.NAMESPACE }}
-            labels:
-              app: ${{ env.SERVICE_NAME }}
           spec:
             to:
               kind: Service
               name: ${{ env.SERVICE_NAME }}
-              weight: 100
             port:
               targetPort: http
             tls:
               termination: edge
-              insecureEdgeTerminationPolicy: Redirect
-            wildcardPolicy: None
-          EOF
+          SVC
 
-      - name: Wait for deployment rollout
+      - name: Restart and wait
         run: |
+          oc rollout restart deployment/${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }}
           oc rollout status deployment/${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }} --timeout=300s
 
-      - name: Get deployment info
+      - name: Show status
         run: |
-          echo "=== Deployment Status ==="
-          oc get deployment ${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }}
-          echo ""
-          echo "=== Pods ==="
           oc get pods -l app=${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }}
-          echo ""
-          echo "=== Route ==="
-          ROUTE_URL=$(oc get route ${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }} -o jsonpath='{.spec.host}')
-          echo "Application URL: https://${ROUTE_URL}"
-          echo "Swagger UI: https://${ROUTE_URL}/swagger-ui.html"
-
-      - name: Deployment Summary
-        run: |
-          ROUTE_URL=$(oc get route ${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }} -o jsonpath='{.spec.host}')
-          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Service | ${{ env.SERVICE_NAME }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Namespace | ${{ env.NAMESPACE }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Tag | ${{ steps.image-tag.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| URL | https://${ROUTE_URL} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Swagger | https://${ROUTE_URL}/swagger-ui.html |" >> $GITHUB_STEP_SUMMARY
+          ROUTE=$(oc get route ${{ env.SERVICE_NAME }} -n ${{ env.NAMESPACE }} -o jsonpath='{.spec.host}')
+          echo "URL: https://${ROUTE}/swagger-ui.html"
